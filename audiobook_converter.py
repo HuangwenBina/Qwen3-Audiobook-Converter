@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+"""
+Qwen-Based Audiobook Converter
+Converts PDFs, EPUBs, DOCX, DOC, TXT files into audiobooks using Qwen Voice API
+
+Author: Rewritten for Qwen Voice Model
+License: MIT
+"""
+
 import os
 import shutil
 import logging
@@ -35,7 +44,7 @@ if sys.platform == 'win32':
 # HARDCODED CONFIGURATION
 # =============================================================================
 
-# Qwen3 API Configuration
+# Qwen API Configuration
 QWEN_API_URL = "http://127.0.0.1:7860"
 API_TIMEOUT = 300
 MAX_RETRIES = 3
@@ -43,9 +52,10 @@ MAX_RETRIES = 3
 # Hardcoded Voice Settings (Always use 1.7B model)
 CUSTOM_VOICE_SPEAKER = "Ryan"
 CUSTOM_VOICE_LANGUAGE = "English"
-CUSTOM_VOICE_INSTRUCT = "Read in a clear, professional, and confident adult narrator's voice. Speak at a natural, conversational pace - not too fast, not too slow. Maintain a mature, authoritative tone suitable for adult literature. Use subtle emphasis and natural pauses only where appropriate for clarity, avoiding any condescending or overly dramatic delivery."
+CUSTOM_VOICE_INSTRUCT = "Speak naturally and clearly, as if reading a dramatic book to an adult audience."
 CUSTOM_VOICE_MODEL_SIZE = "1.7B"  # Always use 1.7B
 CUSTOM_VOICE_SEED = -1
+CUSTOM_VOICE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
 # Voice Clone Settings (Always use 1.7B model)
 VOICE_CLONE_LANGUAGE = "English"
@@ -95,6 +105,7 @@ class QwenAudiobookConverter:
         self.setup_directories()
         self.validate_configuration()
         self.client = None
+        self.api_info: Dict[str, Any] = {}
         self.init_qwen_client()
 
     def setup_logging(self):
@@ -118,11 +129,12 @@ class QwenAudiobookConverter:
 
     def transcribe_audio(self, audio_path: str) -> str:
         """Transcribe audio file using Qwen's Whisper transcription"""
+        transcribe_api = self._resolve_api_name("/transcribe_audio", "/run_transcribe_audio")
         try:
             self.logger.info(f"Transcribing audio: {audio_path}")
             result = self.client.predict(
                 audio=handle_file(audio_path),
-                api_name="/transcribe_audio"
+                api_name=transcribe_api
             )
             transcribed_text = result if isinstance(result, str) else str(result)
             self.logger.info(f"Transcription complete: {transcribed_text[:100]}...")
@@ -160,6 +172,7 @@ class QwenAudiobookConverter:
                 self.client = Client(QWEN_API_URL)
             finally:
                 sys.stdout = old_stdout
+            self.api_info = self._load_api_info()
             self.logger.info("Connected to Qwen API")
             print("[OK] Connected to Qwen API")
             
@@ -169,14 +182,37 @@ class QwenAudiobookConverter:
                 self.voice_clone_ref_text = self.transcribe_audio(self.voice_clone_ref_audio)
                 print(f"[OK] Transcription: {self.voice_clone_ref_text[:100]}...")
         except Exception as e:
-            print(f"[ERROR] Cannot connect to Qwen API!")
+            print("[ERROR] Qwen API initialization failed!")
             print(f"API endpoint: {QWEN_API_URL}")
             print("Make sure:")
             print("1. Qwen Gradio server is running")
             print("2. The server is accessible at the configured URL")
             print("3. The endpoint URL is correct")
+            print("4. Your installed Qwen3-TTS version matches this converter's API expectations")
             print(f"Error: {e}")
             sys.exit(1)
+
+    def _load_api_info(self) -> Dict[str, Any]:
+        """Load available API metadata from Gradio app."""
+        try:
+            return self.client.view_api(return_format="dict")
+        except Exception as exc:
+            self.logger.warning(f"Unable to read API metadata: {exc}")
+            return {}
+
+    def _resolve_api_name(self, *candidates: str) -> str:
+        """Return the first available api_name from candidate list."""
+        named_endpoints = self.api_info.get("named_endpoints", {})
+        for candidate in candidates:
+            if candidate in named_endpoints:
+                return candidate
+        return candidates[0]
+
+    def _endpoint_accepts_param(self, api_name: str, param_name: str) -> bool:
+        """Check whether endpoint input schema includes the given parameter."""
+        endpoint = self.api_info.get("named_endpoints", {}).get(api_name, {})
+        parameters = endpoint.get("parameters", [])
+        return any(parameter.get("parameter_name") == param_name for parameter in parameters)
 
     def generate_chunk_via_qwen(self, text: str, chunk_num: int) -> Optional[str]:
         """Generate audio chunk using Qwen API"""
@@ -222,15 +258,22 @@ class QwenAudiobookConverter:
 
     def _generate_custom_voice(self, text: str) -> Tuple:
         """Generate audio using CustomVoice mode"""
-        return self.client.predict(
+        custom_api = self._resolve_api_name("/run_custom_voice", "/generate_custom_voice")
+        payload = dict(
             text=text,
             language=CUSTOM_VOICE_LANGUAGE,
             speaker=CUSTOM_VOICE_SPEAKER,
             instruct=CUSTOM_VOICE_INSTRUCT,
-            model_size=CUSTOM_VOICE_MODEL_SIZE,
-            seed=CUSTOM_VOICE_SEED,
-            api_name="/generate_custom_voice"
         )
+        if self._endpoint_accepts_param(custom_api, "model_id_cv"):
+            payload["model_id_cv"] = CUSTOM_VOICE_MODEL_ID
+        elif self._endpoint_accepts_param(custom_api, "model_size"):
+            payload["model_size"] = CUSTOM_VOICE_MODEL_SIZE
+
+        if self._endpoint_accepts_param(custom_api, "seed"):
+            payload["seed"] = CUSTOM_VOICE_SEED
+
+        return self.client.predict(**payload, api_name=custom_api)
 
     def _generate_voice_clone(self, text: str) -> Tuple:
         """Generate audio using Voice Clone mode"""
